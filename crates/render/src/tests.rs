@@ -1528,3 +1528,36 @@ fn undecodable_pictures_keep_their_grey_box_pixels() {
     let h = img.pixels.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
     assert_eq!(h, 0x79f9f1d3602a9925, "{h:#x}");
 }
+
+/// A page or area drawn into the caller's buffer is the same raster, row padding cleared, and a
+/// buffer that can't hold it is left as it was.
+#[test]
+fn drawn_into_a_callers_buffer_matches_its_own() {
+    let d = Document::from_text("Hello WordCraft");
+    let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+    let (page, opts) = (&l.pages[0], RenderOptions::default());
+    let own = render_page(&d, page, 1.0, &opts);
+    let (w, h) = page_raster_size(page, 1.0);
+    assert_eq!((w, h), (own.width, own.height));
+    let row = w as usize * 4;
+    for stride in [row, row + 64] {
+        let mut buf = vec![0xAAu8; stride * h as usize + 8];
+        assert_eq!(render_page_into(&d, page, 1.0, &opts, &mut buf, stride), Some((w, h)));
+        for y in 0..h as usize {
+            assert!(buf[y * stride..y * stride + row] == own.pixels[y * row..(y + 1) * row], "row {y}, stride {stride}");
+            assert!(buf[y * stride + row..(y + 1) * stride].iter().all(|b| *b == 0), "padding of row {y}");
+        }
+        assert_eq!(buf[stride * h as usize..], [0xAA; 8], "past the rows");
+    }
+    let area = wordcraft_geom::Rect { x: 50.0, y: 60.0, w: 200.0, h: 100.0 };
+    let own = render_area(&d, page, area, 2.0, &opts);
+    let (w, h) = area_raster_size(area, 2.0);
+    let mut buf = vec![0u8; w as usize * h as usize * 4];
+    assert_eq!(render_area_into(&d, page, area, 2.0, &opts, &mut buf, w as usize * 4), Some((own.width, own.height)));
+    assert!(buf == own.pixels);
+    for (stride, len) in [(w as usize * 4 - 4, buf.len()), (w as usize * 4 + 2, buf.len() * 2), (w as usize * 4, buf.len() - 1)] {
+        let mut short = vec![7u8; len];
+        assert_eq!(render_area_into(&d, page, area, 2.0, &opts, &mut short, stride), None);
+        assert!(short.iter().all(|b| *b == 7));
+    }
+}

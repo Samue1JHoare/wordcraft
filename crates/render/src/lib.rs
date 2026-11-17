@@ -278,10 +278,30 @@ impl Default for RenderOptions {
 
 /// Render a whole page at `scale` pixels per point.
 pub fn render_page(doc: &Document, page: &Page, scale: f32, opts: &RenderOptions) -> Rendered {
+    let (w, h, view) = page_region(page, scale);
+    render_region(doc, page, w, h, view, opts)
+}
+
+/// The raster `w`×`h` and view of a whole page at `scale` pixels per point.
+fn page_region(page: &Page, scale: f32) -> (u32, u32, Affine) {
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let w = ((page.w * scale).ceil() as u32).clamp(1, MAX_SIDE);
     let h = ((page.h.min(1e6) * scale).ceil() as u32).clamp(1, MAX_SIDE);
-    render_region(doc, page, w, h, Affine::scale(scale as f64), opts)
+    (w, h, Affine::scale(scale as f64))
+}
+
+/// the size [`render_page`] draws, for a caller allocating the
+/// buffer of [`render_page_into`].
+pub fn page_raster_size(page: &Page, scale: f32) -> (u32, u32) {
+    let (w, h, _) = page_region(page, scale);
+    region_raster_size(w, h)
+}
+
+/// [`render_page`] into the caller's buffer; see
+/// [`render_region_into`].
+pub fn render_page_into(doc: &Document, page: &Page, scale: f32, opts: &RenderOptions, buf: &mut [u8], stride: usize) -> Option<(u32, u32)> {
+    let (w, h, view) = page_region(page, scale);
+    render_region_into(doc, page, w, h, view, opts, buf, stride)
 }
 
 /// Render a page into a `w`×`h` raster with `view` (page points → pixels).
@@ -291,6 +311,45 @@ pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, 
 
 /// [`render_region`] with an explicit pixel cap (a small one in tests).
 fn render_region_capped(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, opts: &RenderOptions, max_pixels: u64) -> Rendered {
+    let (cw, ch) = capped_size(w, h, max_pixels);
+    let mut pixels = vec![0u8; cw as usize * ch as usize * 4];
+    paint_region(doc, page, w, h, view, opts, max_pixels, &mut pixels, cw as usize * 4);
+    Rendered { width: cw, height: ch, pixels }
+}
+
+/// The raster a `w`×`h` request is drawn at: clamped to [`MAX_SIDE`], then fitted to the cap.
+fn capped_size(w: u32, h: u32, max_pixels: u64) -> (u32, u32) {
+    wordcraft_geom::fit_pixels(w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE), max_pixels)
+}
+
+/// the size [`render_region`] draws a `w`×`h` request at (over
+/// the pixel cap, smaller), for a caller allocating the buffer of [`render_region_into`].
+pub fn region_raster_size(w: u32, h: u32) -> (u32, u32) {
+    capped_size(w, h, wordcraft_geom::MAX_RASTER_PIXELS)
+}
+
+/// [`render_region`] drawn into the caller's buffer instead of one
+/// of its own, so a caller can draw straight into memory the screen shows (an IOSurface): rows of
+/// `stride` bytes, the first `width` × 4 of each the pixels, premultiplied RGBA8; padding bytes are
+/// cleared. Every byte of the first `height` rows is written, whatever it held. The size is
+/// [`region_raster_size`]. `None`, with `buf` untouched, when `stride` is not a whole number of
+/// pixels or is narrower than a row, or `buf` holds fewer than `stride` × `height` bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn render_region_into(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, opts: &RenderOptions, buf: &mut [u8], stride: usize) -> Option<(u32, u32)> {
+    let max_pixels = wordcraft_geom::MAX_RASTER_PIXELS;
+    let (cw, ch) = capped_size(w, h, max_pixels);
+    let rows = stride.checked_mul(ch as usize)?;
+    if !stride.is_multiple_of(4) || stride < cw as usize * 4 || stride / 4 > u16::MAX as usize || buf.len() < rows {
+        return None;
+    }
+    paint_region(doc, page, w, h, view, opts, max_pixels, &mut buf[..rows], stride);
+    Some((cw, ch))
+}
+
+/// Draws a `w`×`h` request into `buf`, rows of `stride` bytes (checked by the callers: a whole
+/// number of pixels, at least a row, and `buf` exactly the rows).
+#[allow(clippy::too_many_arguments)]
+fn paint_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, opts: &RenderOptions, max_pixels: u64, buf: &mut [u8], stride: usize) {
     let (w, h) = (w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE));
     let (cw, ch) = wordcraft_geom::fit_pixels(w, h, max_pixels);
     // Over the cap the whole picture is drawn smaller, not cropped.
@@ -321,13 +380,13 @@ fn render_region_capped(doc: &Document, page: &Page, w: u32, h: u32, view: Affin
         }
     }
     ctx.flush();
-    let mut pixels = vec![0u8; w16 as usize * h16 as usize * 4];
     let mut res = Resources::new();
-    if let Some(pm) = vello_cpu::PixmapMut::new(w16, h16, &mut pixels) {
+    // A pixmap wider than the scene takes the extra columns as row padding, which `Replace` (the
+    // default composite) clears.
+    if let Some(pm) = vello_cpu::PixmapMut::new((stride / 4) as u16, h16, buf) {
         ctx.render(pm, &mut res);
     }
     context_pool::CONTEXTS.give_back(ctx);
-    Rendered { width: w16 as u32, height: h16 as u32, pixels }
 }
 
 /// The on-screen colour behind page point (`x`, `y`): the paper (page colour), then any
@@ -1143,12 +1202,31 @@ pub fn shape_path(kind: ShapeKind, r: kurbo::Rect, corner: Option<u32>) -> BezPa
 
 /// Render the page `area` (points) at `scale` px/pt — for previews and thumbnails.
 pub fn render_area(doc: &Document, page: &Page, area: wordcraft_geom::Rect, scale: f32, opts: &RenderOptions) -> Rendered {
+    let (pw, ph, view) = area_region(area, scale);
+    render_region(doc, page, pw, ph, view, opts)
+}
+
+/// The raster `w`×`h` and view of the page `area` (points) at `scale` px/pt.
+fn area_region(area: wordcraft_geom::Rect, scale: f32) -> (u32, u32, Affine) {
     let wordcraft_geom::Rect { x, y, w, h } = area;
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let pw = ((w * scale).ceil() as u32).clamp(1, MAX_SIDE);
     let ph = ((h * scale).ceil() as u32).clamp(1, MAX_SIDE);
-    let view = Affine::scale(scale as f64) * Affine::translate((-x as f64, -y as f64));
-    render_region(doc, page, pw, ph, view, opts)
+    (pw, ph, Affine::scale(scale as f64) * Affine::translate((-x as f64, -y as f64)))
+}
+
+/// the size [`render_area`] draws, for a caller allocating the
+/// buffer of [`render_area_into`].
+pub fn area_raster_size(area: wordcraft_geom::Rect, scale: f32) -> (u32, u32) {
+    let (w, h, _) = area_region(area, scale);
+    region_raster_size(w, h)
+}
+
+/// [`render_area`] into the caller's buffer; see
+/// [`render_region_into`].
+pub fn render_area_into(doc: &Document, page: &Page, area: wordcraft_geom::Rect, scale: f32, opts: &RenderOptions, buf: &mut [u8], stride: usize) -> Option<(u32, u32)> {
+    let (w, h, view) = area_region(area, scale);
+    render_region_into(doc, page, w, h, view, opts, buf, stride)
 }
 
 /// Draw `items` (page points) alone, on nothing, over the page `area` (points) at `scale` px/pt:
