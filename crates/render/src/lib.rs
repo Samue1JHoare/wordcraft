@@ -1,4 +1,4 @@
-//! WordCraft rasteriser: draws a page's display list with vello_cpu.
+//! Draw a page's display list with vello_cpu, or record supported pages with the scenes feature.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::collections::HashMap;
@@ -17,6 +17,8 @@ use wordcraft_layout::display::Paint;
 use wordcraft_layout::display::{DisplayOptions, Draw, Stroke, page_layers};
 
 mod media;
+#[cfg(feature = "scenes")]
+pub mod scenes;
 
 #[cfg(test)]
 use media::{CACHE_BYTES, MediaCache, OVERSIZED_GLYPHS_NOTED, cacheable, decode_pixmap_within, note_oversized_glyphs, shrink};
@@ -725,7 +727,7 @@ fn draw_fill(ctx: &mut RenderContext, fr: &Frame, it: &Draw) {
     ctx.fill_rect(&r);
 }
 
-fn draw_line(ctx: &mut RenderContext, fr: &Frame, it: &Draw) {
+fn draw_line(ctx: &mut impl OutlineTarget, fr: &Frame, it: &Draw) {
     let Draw::Line { x0, y0, x1, y1, width, color: c, stroke, alpha, text_bg } = it else { return };
     ctx.set_transform(fr.view);
     ctx.set_paint(color(fr.opts.ink_text(*c, *text_bg), *alpha));
@@ -769,14 +771,47 @@ fn draw_line(ctx: &mut RenderContext, fr: &Frame, it: &Draw) {
 }
 
 /// Stroke the line from (`x0`, `y0`) to (`x1`, `y1`), moved by (`ox`, `oy`).
-fn stroke_segment(ctx: &mut RenderContext, (x0, y0, x1, y1): (f64, f64, f64, f64), (ox, oy): (f64, f64)) {
+fn stroke_segment(ctx: &mut impl OutlineTarget, (x0, y0, x1, y1): (f64, f64, f64, f64), (ox, oy): (f64, f64)) {
     let mut p = BezPath::new();
     p.move_to((x0 + ox, y0 + oy));
     p.line_to((x1 + ox, y1 + oy));
     ctx.stroke_path(&p);
 }
 
+// Both vello backends take the same kurbo geometry and peniko colours. Static dispatch
+// keeps text placement, hinting and outline strokes identical for both destinations.
+trait OutlineTarget {
+    fn set_transform(&mut self, view: Affine);
+    fn set_paint(&mut self, paint: peniko::Color);
+    fn set_stroke(&mut self, stroke: kurbo::Stroke);
+    fn fill_path(&mut self, path: &BezPath);
+    fn stroke_path(&mut self, path: &BezPath);
+}
+
+macro_rules! outline_target {
+    ($ty:ty) => {
+        impl OutlineTarget for $ty {
+            fn set_transform(&mut self, view: Affine) { self.set_transform(view); }
+            fn set_paint(&mut self, paint: peniko::Color) { self.set_paint(paint); }
+            fn set_stroke(&mut self, stroke: kurbo::Stroke) { self.set_stroke(stroke); }
+            fn fill_path(&mut self, path: &BezPath) { self.fill_path(path); }
+            fn stroke_path(&mut self, path: &BezPath) { self.stroke_path(path); }
+        }
+    };
+}
+
+outline_target!(RenderContext);
+#[cfg(feature = "scenes")]
+outline_target!(vello_hybrid::Scene);
+
 fn draw_glyphs(ctx: &mut RenderContext, fr: &Frame, it: &Draw) {
+    draw_glyph_run(ctx, fr, it, color_glyph::draw);
+}
+
+fn draw_glyph_run<T: OutlineTarget>(
+    ctx: &mut T, fr: &Frame, it: &Draw,
+    draw_color: impl Fn(&mut T, &color_glyph::Drawable, Affine, f64, peniko::Color, f32),
+) {
     let Draw::Glyphs { face, size, glyphs, color: c, alpha, synth_bold, synth_italic, text_bg, x_scale, .. } = it else { return };
     // Invisible glyphs (WordArt letters are drawn from their outlines) carry text only.
     if *alpha <= 0.0 {
@@ -819,7 +854,7 @@ fn draw_glyphs(ctx: &mut RenderContext, fr: &Frame, it: &Draw) {
         }
         if colour && let Some(d) = color_glyph::drawable(face, *gid, ppem, true) {
             let at = view * Affine::translate((gx, gy)) * skew * Affine::scale(k);
-            color_glyph::draw(ctx, &d, at, face.upem, color(opts.ink(*c), 1.0), *alpha);
+            draw_color(ctx, &d, at, face.upem, color(opts.ink(*c), 1.0), *alpha);
             ctx.set_paint(color(opts.ink(*c), *alpha));
             continue;
         }
