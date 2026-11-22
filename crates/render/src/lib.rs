@@ -784,7 +784,6 @@ trait OutlineTarget {
     fn set_transform(&mut self, view: Affine);
     fn set_paint(&mut self, paint: peniko::Color);
     fn set_stroke(&mut self, stroke: kurbo::Stroke);
-    fn fill_path(&mut self, path: &BezPath);
     fn stroke_path(&mut self, path: &BezPath);
 }
 
@@ -794,7 +793,6 @@ macro_rules! outline_target {
             fn set_transform(&mut self, view: Affine) { self.set_transform(view); }
             fn set_paint(&mut self, paint: peniko::Color) { self.set_paint(paint); }
             fn set_stroke(&mut self, stroke: kurbo::Stroke) { self.set_stroke(stroke); }
-            fn fill_path(&mut self, path: &BezPath) { self.fill_path(path); }
             fn stroke_path(&mut self, path: &BezPath) { self.stroke_path(path); }
         }
     };
@@ -804,11 +802,23 @@ outline_target!(RenderContext);
 #[cfg(feature = "scenes")]
 outline_target!(vello_hybrid::Scene);
 
+trait GlyphTarget: OutlineTarget {
+    fn glyph(&mut self, path: &Arc<BezPath>, at: Affine, stroke: bool);
+}
+
+impl GlyphTarget for RenderContext {
+    fn glyph(&mut self, path: &Arc<BezPath>, at: Affine, stroke: bool) {
+        self.set_transform(at);
+        self.fill_path(path);
+        if stroke { self.stroke_path(path); }
+    }
+}
+
 fn draw_glyphs(ctx: &mut RenderContext, fr: &Frame, it: &Draw) {
     draw_glyph_run(ctx, fr, it, color_glyph::draw);
 }
 
-fn draw_glyph_run<T: OutlineTarget>(
+fn draw_glyph_run<T: GlyphTarget>(
     ctx: &mut T, fr: &Frame, it: &Draw,
     draw_color: impl Fn(&mut T, &color_glyph::Drawable, Affine, f64, peniko::Color, f32),
 ) {
@@ -864,30 +874,24 @@ fn draw_glyph_run<T: OutlineTarget>(
             }
             // The baseline on a whole pixel, as the hinting assumes.
             let at = view * kurbo::Point::new(gx, gy);
-            ctx.set_transform(Affine::translate((at.x, at.y.round())) * skew);
-            ctx.fill_path(&o);
-            if outline_stroke > 0.0 {
-                if !hinted_stroke {
-                    ctx.set_stroke(kurbo::Stroke::new(stroke_px).with_join(join));
-                    hinted_stroke = true;
-                }
-                ctx.stroke_path(&o);
+
+            if outline_stroke > 0.0 && !hinted_stroke {
+                ctx.set_stroke(kurbo::Stroke::new(stroke_px).with_join(join));
+                hinted_stroke = true;
             }
+            ctx.glyph(&o, Affine::translate((at.x, at.y.round())) * skew, outline_stroke > 0.0);
             continue;
         }
         let o = db.outline(face, *gid);
         if o.elements().is_empty() {
             continue;
         }
-        ctx.set_transform(view * Affine::translate((gx, gy)) * skew * Affine::scale(k));
-        ctx.fill_path(&o);
-        if outline_stroke > 0.0 {
-            if hinted_stroke {
-                ctx.set_stroke(kurbo::Stroke::new(outline_stroke).with_join(join));
-                hinted_stroke = false;
-            }
-            ctx.stroke_path(&o);
+
+        if outline_stroke > 0.0 && hinted_stroke {
+            ctx.set_stroke(kurbo::Stroke::new(outline_stroke).with_join(join));
+            hinted_stroke = false;
         }
+        ctx.glyph(&o, view * Affine::translate((gx, gy)) * skew * Affine::scale(k), outline_stroke > 0.0);
     }
 }
 

@@ -12,7 +12,9 @@ pub fn record(doc: &Document, page: &Page, area: Option<wordcraft_geom::Rect>, s
     if (w, h) != region_raster_size(w, h) || w.max(h) > u32::from(max_side) {
         return None;
     }
-    let mut scene = Scene::new(w as u16, h as u16);
+    let mut scene = Scene::new_with(w as u16, h as u16, vello_hybrid::RenderSettings {
+        constraints: vello_hybrid::SceneConstraints::new().default_blending_only(), ..Default::default()
+    });
     let bounds = kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h));
     scene.set_paint(color(opts.paper_of(doc), 1.0));
     scene.fill_rect(&bounds);
@@ -45,4 +47,60 @@ pub fn record(doc: &Document, page: &Page, area: Option<wordcraft_geom::Rect>, s
         }
     }
     Some(scene)
+}
+
+/// The font database already interns both hinted and unhinted outlines. Cache the other
+/// expensive geometry, the stroke used to darken an outline, before positioning the glyph.
+#[derive(Default)]
+struct GlyphCache {
+    entries: HashMap<(usize, u64, u64, u8), CachedGlyph>,
+    bytes: usize,
+}
+
+struct CachedGlyph {
+    // Retain the key's allocation so its address cannot be recycled.
+    _outline: Arc<BezPath>,
+    stroke: BezPath,
+    bounds: kurbo::Rect,
+}
+
+impl GlyphTarget for Scene {
+    fn glyph(&mut self, path: &Arc<BezPath>, at: Affine, stroked: bool) {
+        thread_local! { static CACHE: std::cell::RefCell<GlyphCache> = Default::default(); }
+        let viewport = kurbo::Rect::new(0., 0., f64::from(self.width()), f64::from(self.height())).inflate(1., 1.);
+        CACHE.with_borrow_mut(|cache| {
+            let style = self.stroke();
+            // Same tolerance and expansion as vello_common 0.0.9 flatten::stroke.
+            let m = at.as_coeffs();
+            let tol = 0.25 / m[0].abs().max(m[3].abs()).max(1.);
+            let key = (Arc::as_ptr(path) as usize, if stroked { style.width.to_bits() } else { 0 }, tol.to_bits(), style.join as u8);
+            let build = || {
+                let stroke = if stroked { kurbo::stroke(path.elements().iter().copied(), style, &Default::default(), tol) } else { BezPath::new() };
+                let mut bounds = path.control_box();
+                if stroked { bounds = bounds.union(stroke.control_box()); }
+                CachedGlyph { _outline: path.clone(), stroke, bounds }
+            };
+            let transient;
+            let glyph = if let Some(hit) = cache.entries.get(&key) {
+                hit
+            } else {
+                let new = build();
+                let bytes = (path.elements().len() + new.stroke.elements().len()) * std::mem::size_of::<kurbo::PathEl>() + 128;
+                const BUDGET: usize = 2 << 20;
+                if bytes > BUDGET {
+                    transient = new;
+                    &transient
+                } else {
+                    if cache.bytes + bytes > BUDGET { cache.entries.clear(); cache.bytes = 0; }
+                    cache.bytes += bytes;
+                    cache.entries.entry(key).or_insert(new)
+                }
+            };
+            if at.transform_rect_bbox(glyph.bounds).overlaps(viewport) {
+                self.set_transform(at);
+                self.fill_path(path);
+                if stroked { self.fill_path(&glyph.stroke); }
+            }
+        });
+    }
 }
